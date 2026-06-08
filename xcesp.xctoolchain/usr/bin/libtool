@@ -1,0 +1,95 @@
+#!/usr/bin/env zsh
+#
+# xcesp
+# Copyright 2026 Christian Kohlschütter
+# SPDX-License-Identifier: Apache-2.0
+#
+
+if [[ $# -eq 1 ]]; then
+  case "$1" in
+    -V)
+     echo "Apple Inc. version cctools_ld-1267"
+     exit 0
+     ;;
+  esac
+fi
+
+if [[ -z "$XCESP_CLANG" ]]; then
+  # This assumes the script is in xcesp/xcesp.xctoolchain/usr/bin/
+  # and a symbolic link from xcesp/esp-clang to the real clang installation exists
+  XCESP_CLANG=$(realpath $0/../../../../esp-clang)
+fi
+
+export PATH=$(dirname $(realpath $0)):$PATH
+export PATH=$XCESP_CLANG/bin:$PATH
+
+inargs=( $@ )
+
+static=0
+filelist=
+output=
+depFile=
+
+skip=0
+while [[ ${#inargs} -gt 0 ]]; do
+  a=${inargs[1]}
+  shift inargs
+
+  if [[ $skip -gt 0 ]]; then
+    skip=$(( $skip - 1 ))
+    continue
+  fi
+
+  case "$a" in
+    -static)
+        static=1
+        ;;
+    -arch_only)
+        skip=1
+        ;;
+    -syslibroot)
+        skip=1
+        ;;
+    -dependency_info)
+        depFile=${inargs[1]}
+        skip=1
+        ;;
+    -L/*)
+        # FIXME?
+        ;;
+    -filelist)
+        filelist=${inargs[1]}
+        skip=1
+        ;;
+    -o)
+        output=${inargs[1]}
+        skip=1
+        ;;
+    -D)
+        # Set reasonable file defaults
+        ;;
+    *)
+        echo "Unexpected token: $a" >&2
+        exit 1
+  esac
+done
+
+if [[ $static -ne 1 ]]; then
+  echo "Unexpected invocation: not static" >&2
+  exit 1
+fi
+if [[ -z $filelist ]]; then
+  echo "Unexpected invocation: no filelist" >&2
+  exit 1
+fi
+if [[ -z $output ]]; then
+  echo "Unexpected invocation: no output" >&2
+  exit 1
+fi
+
+if [[ $depFile =~ .*\.dat ]]; then
+  # Create dummy dependency_info file
+  echo -n -e '\x000\x00' > "$depFile"
+fi
+
+exec $XCESP_CLANG/bin/llvm-ar rcs "$output" @"$filelist"

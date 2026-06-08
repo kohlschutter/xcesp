@@ -1,0 +1,127 @@
+#!/usr/bin/env zsh
+#
+# xcesp
+# Copyright 2026 Christian Kohlschütter
+# SPDX-License-Identifier: Apache-2.0
+#
+
+appName=$(basename $0)
+if [[ -n "$COLORTERM" ]]; then
+    appColor="\e[0;34m"
+    errorColor="\e[0;31m"
+    noticeColor="\e[0;32m"
+    endColor="\e[0m"
+else
+    appColor=
+    errorColor=
+    noticeColor=
+    endColor=
+fi
+
+function exitError() {
+  if [[ $# -eq 0 ]]; then
+    printf "$appColor$appName:$endColor ${errorColor}Error: " >&2
+    cat >&2
+    printf "$endColor"
+  else
+    printf "$appColor$appName:$endColor ${errorColor}Error: %s$endColor\n" $@ >&2
+  fi
+  exit 1
+}
+
+function showInfo() {
+  if [[ $# -eq 0 ]]; then
+    printf "$appColor$appName:$endColor "
+    cat
+  else
+    printf "$appColor$appName:$endColor %s\n" "$1"
+  fi
+}
+
+cd "$(dirname $0)"
+set -e
+pwd=$(realpath)
+set +e
+
+if [[ -z "$pwd" ]]; then
+  exitError <<EOT
+Could not determine pwd
+EOT
+fi
+
+if [[ -z "$IDF_PATH" ]]; then
+  exitError <<EOT
+No path to your ESP-IDF installation found. Set IDF_PATH and try again.
+Use the following command (example):
+# source /path/to/esp-idf/export.sh
+EOT
+fi
+
+for f in "$IDF_PATH/export.sh"; do
+    if [[ ! -e "$f" ]]; then
+        exitError <<EOT
+\$IDF_PATH doesn't look like an ESP-IDF project directory -- file not found: "$f"
+EOT
+    fi
+done
+
+showInfo "Sym-linking esp-idf to $IDF_PATH"
+ln -sfv "$IDF_PATH" esp-idf
+
+showInfo "Initializing ESP-IDF via $IDF_PATH/export.sh"
+set -e
+source "$IDF_PATH/export.sh"
+set +e
+
+clang=$(which clang)
+printf "%s" "$clang" | grep -q esp-clang
+if [[ $? -ne 0 ]]; then
+    exitError <<EOT
+clang in PATH doesn't look like it belongs to ESP-IDF: $clang
+EOT
+fi
+
+espclang=$(realpath "$clang/../..")
+if [[ -z "$espclang" ]]; then
+    exitError <<EOT
+Could not determine esp-clang directory from $clang
+EOT
+fi
+
+showInfo "Sym-linking esp-clang to $espclang"
+ln -sfv "$espclang" esp-clang
+
+toolchainsPath="$HOME/Library/Developer/Toolchains"
+
+showInfo "Using Xcode toolchains directory $toolchainsPath"
+echo "Toolchains path: $toolchainsPath"
+if [[ ! -d "$toolchainsPath" ]]; then
+    mkdir -pv "$toolchainsPath"
+fi
+
+for toolchain in $(ls -1 | grep '\.xctoolchain$'); do
+    showInfo "Installing $toolchain"
+    echo Installing "$toolchain" ...
+    ( cd "$toolchainsPath" ; ln -sfv "$pwd/$toolchain" )
+done
+echo
+
+cat $HOME/.zprofile | grep -q "# Added by xcesp"
+if [[ $? -ne 0 ]]; then
+    showInfo "Adding PATH to $HOME/.zprofile"
+    cat >>$HOME/.zprofile <<EOT
+# Added by xcesp
+source "$pwd/env.sh"
+EOT
+fi
+
+if [ $? -eq 0 ]; then
+    showInfo <<EOT
+Done. Now please restart Xcode.
+For xcesp development, set the Toolchain (Xcode->Toolchains...) to "xcesp".
+EOT
+else
+    exitError <<EOT
+There were errors
+EOT
+fi

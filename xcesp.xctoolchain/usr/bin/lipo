@@ -1,0 +1,23 @@
+#!/usr/bin/env zsh
+#
+# xcesp
+# Copyright 2026 Christian Kohlschütter
+# SPDX-License-Identifier: Apache-2.0
+#
+
+#  -create arm64File x86_64File -output outputFile
+
+if [[ "$1" != "-create" ]]; then
+  echo "Unsupported invocation (1): $0 $@" >&2
+  exit 1
+fi
+if [[ "$4" != "-output" ]]; then
+  echo "Unsupported invocation (4): $0 $@" >&2
+  exit 1
+fi
+if [[ -z "$5" ]]; then
+  echo "Unsupported invocation (5): $0 $@" >&2
+  exit 1
+fi
+
+cp -- "$2" "$5"

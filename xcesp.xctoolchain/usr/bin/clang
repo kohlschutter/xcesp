@@ -1,0 +1,297 @@
+#!/usr/bin/env zsh
+#
+# xcesp
+# Copyright 2026 Christian Kohlschütter
+# SPDX-License-Identifier: Apache-2.0
+#
+
+if [[ -z "$XCESP_CLANG" ]]; then
+  # This assumes the script is in xcesp/xcesp.xctoolchain/usr/bin/
+  # and a symbolic link from xcesp/esp-clang to the real clang installation exists
+  XCESP_CLANG=$(realpath $0/../../../../esp-clang)
+fi
+
+export PATH=$(dirname $(realpath $0)):$PATH
+export PATH=$XCESP_CLANG/bin:$PATH
+
+tool=$(basename $0)
+
+case "$tool" in
+  clang++)
+    clang=clang++
+    ;;
+  *)
+    clang=clang
+    ;;
+esac
+
+args=()
+useMacosClang=0
+
+if [[ $1 == "-index-store-path" && $# -eq 2 ]]; then
+  echo "Warning: Possible Xcode bug! Indexing failed -- Move IDF project to another location and rebuild" >&2
+  exit 0
+fi
+
+function collect_args() {
+    for a in "$@"; do
+        case "$a" in
+            @*)
+              a=${a:1}
+              [[ ${a:0:1} == '"' ]] && a=$(printf "%b" ${a:1:-1})
+              [[ ${a:0:1} == "'" ]] && a=${a:1:-1}
+              for a in $(
+                  a=$( cat "${a}" )
+                  a=( ${(z)a} )
+                  for a in ${a[@]}; do
+                    [[ ${a:0:1} == '"' ]] && a=$(printf "%b" ${a:1:-1})
+                    [[ ${a:0:1} == "'" ]] && a=${a:1:-1}
+                    collect_args "$a"
+                  done
+              ); do
+                printf "%s\n" "$a"
+              done
+              ;;
+           *)
+            printf "%s\n" "$a"
+        esac
+    done
+}
+
+inargs=$(collect_args $@ | tr '\n' ' ')
+inargs=( ${(z)inargs} )
+
+inargsCopy=( ${inargs[@]} )
+# echo ${inargs[@]} >> /tmp/args
+
+initialArgs=(
+-Wno-unused-command-line-argument
+)
+nonMacosArgs=(
+    "-mtext-section-literals" # esp_ot_trel; not supported by default Xcode clang
+)
+extraArgs=(
+    "-Wno-error=unknown-attributes"
+    "-Wno-error=shorten-64-to-32"
+    "-Wno-error=extern-c-compat"
+    "-Wno-error=atomic-alignment"
+    "-Wno-error=constant-logical-operand"
+    "-Wno-error=gnu-variable-sized-type-not-at-end"
+    "-Wno-error=unused-value"
+    "-Wno-error=address-of-packed-member" # seen with fast_prov_server (because only GCC diagnostic ignored)
+    "-Wno-error=parentheses-equality" # seen in ble_ancs
+    "-Wno-error=unknown-warning-option" # esp_ot_trel
+    "-Wno-error=format" # esp_ot_trel
+
+    "-Wno-error=sometimes-uninitialized" # seen in ble_att_clt.c (nimble_beacon)
+
+    "-Wno-char-subscripts"
+    "-Wno-shorten-64-to-32"
+
+    "-Os" # ble_chan_sound_reflector: "DRAM segment data does not fit." with -O0
+
+    # FIXME defined for simplicity; ultimately, ESP-IDF code base should be fixed
+    "-Dno_sanitize_undefined=no_sanitize(\"undefined\")"
+)
+needE=0
+
+# We need to specify a default architecture to be used during project setup (cmake)
+XCESP_ARCH=xtensa-esp-elf
+XCESP_CPU=esp32s2
+xcespArchFixed=0
+mcpu=
+mabi=
+mdiv=
+march=
+
+skip=0
+while [[ ${#inargs} -gt 0 ]]; do
+  a=${inargs[1]}
+  shift inargs
+
+  if [[ $skip -gt 0 ]]; then
+    skip=$(( $skip - 1 ))
+    continue
+  fi
+
+  case "$a" in
+    -C)
+        # "bootloader" phase may call clang from within cmake with -C but not with -E
+        needE=1
+        ;;
+    -E)
+        needE=1
+        continue
+        ;;
+    -o)
+        case "${inargs[1]}" in
+          *.i)
+              # Xcode wants to show proprocessed output
+              needE=1
+            ;;
+         *.s)
+              # Xcode wants to show assembled output
+             needE=0
+             ;;
+        esac
+        ;;
+    -target)
+        skip=1; continue
+        ;;
+    --target=*)
+        continue
+        ;;
+    -arch)
+        skip=1; continue
+        ;;
+    -DXCESP_ARCH=*)
+        [[ $xcespArchFixed -eq 1 ]] && continue
+        XCESP_ARCH=${a#*=}
+        ;;
+    -DXCESP_CPU=*)
+        [[ $xcespArchFixed -eq 1 ]] && continue
+        XCESP_CPU=${a#*=}
+        ;;
+    -isysroot)
+        # ignore macOS SDK
+        skip=1; continue
+        ;;
+    -filelist)
+        # instead of specifying the files, these are contained in this file -> add them
+        extraArgs+=( $(cat "${inargs[1]}") )
+        skip=1; continue
+        ;;
+    -index-store-path)
+        # This indicates we're indexing within Xcode; that requires the macOS clang
+        # and some additional args
+        useMacosClang=1
+
+        args+=(-Wno-uninitialized-const-pointer)
+        ;;
+    -mcpu=*)
+        mcpu=${a#*=}
+        XCESP_CPU="$mcpu"
+        continue
+        ;;
+    -mabi=*)
+        nonMacosArgs+=( $a )
+        XCESP_ARCH=riscv32-esp-elf
+        mcpu=
+        continue
+        ;;
+    -mdiv)
+        mdiv=1
+        continue
+        ;;
+    -mno-div)
+        mdiv=0
+        continue
+        ;;
+    --ld-path=riscv32-esp-*)
+        # TryCompile/ULP workaround
+        XCESP_ARCH=riscv32-esp-elf
+        XCESP_CPU=
+        mcpu=
+        xcespArchFixed=1
+        ;;
+    -march=rv32*)
+        # TryCompile/ULP workaround
+        march=${a#*=}
+        XCESP_ARCH=riscv32-esp-elf
+        XCESP_CPU=
+        mcpu=
+        xcespArchFixed=1
+        ;;
+    -march=*)
+        march=${a#*=}
+        ;;
+    -Xlinker)
+        # skip macOS related flags
+        case "${inargs[1]}" in
+          -reproducible|-no_deduplicate|-no_adhoc_codesign|-dead_strip)
+            skip=1; continue
+            ;;
+          -dependency_info)
+            skip=3
+            depFile=${inargs[3]}
+            if [[ $depFile =~ .*\.dat ]]; then
+              # Create dummy dependency_info file
+              echo -n -e '\x000\x00' > "$depFile"
+            fi
+            continue
+            ;;
+        esac
+        ;;
+     -Wl,--no-warn-rwx-segments)
+        # may not be supported by ld.lld
+        continue
+        ;;
+     -ftree-switch-conversion)
+        # GCC specific, not supported by clang
+        continue
+        ;;
+     -fconcepts)
+        # GCC specific, not supported by clang
+        # covered with -std=c++20
+        continue
+        ;;
+  esac
+
+  args+=("$a")
+done
+
+[[ -n "$XCESP_ARCH" ]] && args+=(--target="$XCESP_ARCH")
+[[ -z "$mcpu" && "$XCESP_ARCH" == xtensa* ]] && mcpu="$XCESP_CPU"
+[[ -n "$mcpu" ]] && nonMacosArgs+=(-mcpu="$mcpu")
+
+if [[ -n "$mdiv" ]]; then
+    # -mdiv/-mno-div was specified, which is a GCC-only flag; clang handles this via -march.
+    if [[ $mdiv -eq 1 ]]; then
+        # Ignore this flag for architectures known to cover this
+        case "$march" in
+          rv32im*)
+            # Already included
+            ;;
+          *)
+            # will probably fail
+            args+=("-mdiv")
+            ;;
+        esac
+    else
+        # will probably fail
+        args+=("-mno-div")
+    fi
+fi
+
+if [[ $needE -eq 1 ]]; then
+  args+=("-E")
+fi
+
+if [[ $useMacosClang -eq 1 ]]; then
+  cc=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/$clang
+  if [[ ! -f "$cc" ]]; then
+    cc=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/bin/$clang
+  fi
+  nonMacosArgs=()
+else
+  if [[ -z "$XCESP_CLANG" ]]; then
+    echo "Error: XCESP_CLANG not defined" >&2
+    exit 1
+  fi
+  cc="$XCESP_CLANG/bin/$clang"
+fi
+
+# comment the following line to enable xcesp debugging
+exec $cc ${initialArgs[@]} ${args[@]} ${nonMacosArgs[@]} ${extraArgs[@]}
+
+# for xcesp-internal debugging only:
+$cc ${initialArgs[@]} ${args[@]} ${nonMacosArgs[@]} ${extraArgs[@]}
+rc=$?
+if [[ $rc -ne 0 ]]; then
+    cat >>/tmp/xcesp-fail <<EOT
+INARGS ${inargsCopy[@]}
+$cc ${initialArgs[@]} ${args[@]} ${nonMacosArgs[@]} ${extraArgs[@]}
+
+EOT
+fi
+exit $rc

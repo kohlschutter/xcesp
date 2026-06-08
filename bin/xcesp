@@ -1,0 +1,591 @@
+#!/usr/bin/env zsh
+#
+# xcesp
+# Copyright 2026 Christian Kohlschütter
+# SPDX-License-Identifier: Apache-2.0
+#
+
+appName=$(basename $0)
+if [[ -n "$COLORTERM" ]]; then
+    appColor="\e[0;34m"
+    errorColor="\e[0;31m"
+    noticeColor="\e[0;32m"
+    endColor="\e[0m"
+else
+    appColor=
+    errorColor=
+    noticeColor=
+    endColor=
+fi
+
+XCESP_DIR=$(realpath $0/../..)
+
+if [[ -z "$XCESP_CLANG" ]]; then
+  XCESP_CLANG=$(realpath $XCESP_DIR/esp-clang)
+fi
+
+if [[ -z "$IDF_PATH" ]]; then
+  if [[ -e "$XCESP_DIR/esp-idf" ]]; then
+    export IDF_PATH=$(realpath "$XCESP_DIR/esp-idf")
+  fi
+fi
+
+function exitError() {
+  if [[ $# -eq 0 ]]; then
+    printf "$appColor$appName:$endColor ${errorColor}Error: " >&2
+    cat >&2
+    printf "$endColor"
+  else
+    printf "$appColor$appName:$endColor ${errorColor}Error: %s$endColor\n" $@ >&2
+  fi
+  exit 1
+}
+
+function showInfo() {
+  if [[ $# -eq 0 ]]; then
+    printf "$appColor$appName:$endColor "
+    cat
+  else
+    printf "$appColor$appName:$endColor %s\n" "$1"
+  fi
+}
+
+function showNotice() {
+  if [[ $# -eq 0 ]]; then
+    printf "$appColor$appName:$endColor $noticeColor"
+    cat
+    printf "$endColor"
+  else
+    printf "$appColor$appName:$endColor ${noticeColor}%s${endColor}\n" "$1"
+  fi
+}
+
+if [[ -z "$IDF_PATH" ]]; then
+  exitError "No path to your ESP-IDF installation found. Set IDF_PATH and try again."
+  exit 1
+fi
+
+export PATH=$XCESP_CLANG/bin:$PATH
+
+export IDF_TOOLCHAIN=clang
+export TOOLCHAINS=com.kohlschutter.xcesp.toolchain
+#source "$IDF_PATH"/export.sh
+
+function showSyntax() {
+  echo "Syntax: $appName [--help|OPTIONS] [<path-to-IDF-project>]"
+  return 0
+}
+
+function showHelp() {
+  showSyntax
+cat <<EOT
+
+OPTIONS:
+        --set-target TARGET Set the ESP device target (invokes idf.py set-target)
+        -t TARGET
+
+        --menuconfig        Run idf.py menuconfig before setting up the Xcode project
+        -m
+
+        --force             Create the "build-xcesp" directory from scratch.
+        -f                  In combination with "--set-target", also deletes the "build" directory
+
+        --flash             Flashes the binary to the device (using idf.py)
+
+        --xcbuild           Build the project using xcodebuild
+        -x
+
+        --watch             Display serial output from the device (using idf.py monitor)
+        -w                  Exit with CTRL-]
+
+        --no-open           Do not automatically open the Xcode project
+        -O
+
+        --open              Automatically open the Xcode project, even if we wouldn't
+        -o                  (e.g., when specifying --monitor, --flash, --xcbuild)
+
+        --scheme SCHEME     Use SCHEME as the build scheme for xcodebuild
+        -s                  (default: ALL_BUILD)
+
+        --same-derived-data Use the same DerivedData folder for interactive Xcode and xcodebuild
+
+        --idf COMMAND       Run the specific idf command
+        -i COMMAND
+EOT
+  return 0
+}
+
+notesAtEnd=()
+open=1
+forceReason=
+target=
+menuconfig=0
+build=0
+flash=0
+monitor=0
+idfCommand=
+force=0
+scheme=ALL_BUILD
+derivedDataXcb=DerivedData.xcb
+
+function requireArg() {
+    [[ ${#inargs} -lt 2 ]] && exitError "Argument required: ${inargs[1]}"
+}
+
+inargs=( $@ )
+while [[ ${#inargs} -gt 0 ]]; do
+  a=${inargs[1]}
+
+  case "$a" in
+    -help|--help|-h)
+      showHelp
+      exit 0
+      ;;
+    --)
+      shift inargs
+      break
+      ;;
+    -f|--force)
+      force=1
+      forceReason="requested"
+      ;;
+    -t|--set-target)
+      requireArg
+      target="${inargs[2]}"
+      shift inargs
+      ;;
+    -s|--scheme)
+      requireArg
+      scheme="${inargs[2]}"
+      shift inargs
+      ;;
+    -i|--idf)
+      requireArg
+      idfCommand="${inargs[2]}"
+      shift inargs
+      [[ $open -eq 1 ]] && open=0
+      ;;
+    -m|--menuconfig)
+      menuconfig=1
+      ;;
+    -O|--no-open)
+      open=0
+      ;;
+    -o|--open)
+      open=2
+      ;;
+    -x|--xcbuild)
+      build=1
+      [[ $open -eq 1 ]] && open=0
+      ;;
+    --flash)
+      flash=1
+      [[ $open -eq 1 ]] && open=0
+      ;;
+    -w|--watch)
+      monitor=1
+      [[ $open -eq 1 ]] && open=0
+      ;;
+    --same-derived-data)
+      derivedDataXcb=DerivedData
+      ;;
+    -*)
+      echo "Unknown option: $a" >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift inargs 2>/dev/null
+done
+
+if [[ ${#inargs} -eq 0 ]]; then
+  inargs=(.)
+fi
+
+params=()
+while [[ ${#inargs} -gt 0 ]]; do
+  a=${inargs[1]}
+  shift inargs
+
+  case "$a" in
+    -help|--help|-h)
+      showHelp
+      exit 0
+      ;;
+    -*)
+      exitError "Option found after regular argument: $a"
+      ;;
+  esac
+
+  params+=("$a")
+done
+
+if [[ ${#params} -ne 1 ]]; then
+  exitError "Must specify exactly one project but has ${#params}"
+fi
+
+project=${params[1]}
+if [[ -z "$project" ]]; then
+  exitError "Project path cannot be empty"
+fi
+
+# Xcode does not like symbolic links
+projectRelative=$project
+project=$(realpath -- "$project")
+
+if [[ ! -d "$project" ]]; then
+  exitError "Not a directory: $project"
+fi
+
+cd "$project"
+xcespBuildDir="$project/build-xcesp"
+
+if [[ -d "$xcespBuildDir" ]]; then
+    xcodeproj=$(find $xcespBuildDir/ -name "*.xcodeproj" -maxdepth 1 | head -n 1)
+else
+    xcodeproj=
+fi
+
+if [[ -z "$xcodeproj" ]]; then
+    [[ -z "$forceReason" ]] && forceReason="Build directory incomplete"
+fi
+
+showInfo "Using IDF_PATH: $IDF_PATH"
+
+for f in sdkconfig CMakeLists.txt; do
+    ls -1 "$project" | grep -q "$f" || exitError <<EOT
+This doesn't look like an ESP-IDF project directory -- file not found: $projectRelative/$f
+EOT
+done
+
+if [[ -n "$target" ]]; then
+    if [[ $force -gt 0 ]]; then
+        showInfo "Deleting esp-idf build folder"
+        rm -rf "$project/build"
+    fi
+    showInfo "Setting target via idf.py to: $target"
+    which idf.py >/dev/null || source "$IDF_PATH/export.sh"
+    export IDF_TOOLCHAIN=clang
+    idf.py set-target "$target" || exit $?
+    showInfo "Completed setting target to: $target"
+fi
+
+if [[ $menuconfig -gt 0 ]]; then
+    showInfo "Running idf.py menuconfig"
+    which idf.py >/dev/null || source "$IDF_PATH/export.sh"
+    export IDF_TOOLCHAIN=clang
+    idf.py menuconfig || exit $?
+    showInfo "Completed running idf.py menuconfig"
+fi
+
+# Check if we need to rebuild the build-xcesp directory
+if [[ -z "$forceReason" && -f "$xcespBuildDir/sdkconfig" ]]; then
+  cmp --quiet "$project/sdkconfig" "$xcespBuildDir/sdkconfig"
+  if [[ $? -ne 0 ]]; then
+    forceReason="sdkconfig changed"
+  fi
+fi
+
+if [[ -n "$forceReason" ]]; then
+    # We need to close any existing Xcode windows for the xcodeproj during rebuild
+    if [[ -n "$xcodeproj" ]]; then
+        pgrep Xcode >/dev/null
+        if [[ $? -eq 0 ]]; then
+            showInfo "Closing Xcode project: $xcodeproj"
+            osascript <<EOT
+    tell application "Xcode"
+        repeat with w in windows
+            try
+                set docPath to path of document of w
+
+                if docPath is "$xcodeproj" then
+                    close w
+                end if
+            end try
+        end repeat
+    end tell
+EOT
+        fi
+    fi
+
+    if [[ ! -e "$project/sdkconfig" ]]; then
+        exitError <<EOT
+File not found: $projectRelative/sdkconfig
+Re-run $appName with --set-target esp32s2 or similar
+EOT
+    fi
+
+    which idf.py >/dev/null || source "$IDF_PATH/export.sh"
+    export IDF_TOOLCHAIN=clang
+
+    grep -q "^CONFIG_IDF_TOOLCHAIN=" "$project/sdkconfig"
+    if [[ $? -ne 0 ]]; then
+      exitError "Invalid sdkconfig file: $projectRelative/sdkconfig"
+    fi
+
+    set -e
+
+    # NOTE: This assumes that "sdkconfig" is well-formed
+    source "$project/sdkconfig"
+
+    set +e
+
+    if [[ "$CONFIG_IDF_TOOLCHAIN" != "clang" ]]; then
+      exitError <<EOT
+sdkconfig does not use CONFIG_IDF_TOOLCHAIN=clang
+Please fix by re-running $appName with specifying a target (--set-target esp32s2 or similar)
+EOT
+    fi
+
+    cpu="$CONFIG_IDF_TARGET"
+    targetArch=
+    targetCpu=$cpu
+
+    systemHeaderClangArgs=()
+    case "$CONFIG_IDF_TARGET_ARCH" in
+      xtensa)
+        # targetArch="xtensa-esp-unknown-elf"
+        targetArch="xtensa-esp-elf"
+        systemHeaderClangArgs+=(-target "$targetArch" -mcpu="$cpu")
+        ;;
+      riscv)
+        # FIXME: No ESP devices use riscv64 yet; this may need to be revised once there are such devices
+        targetArch="riscv32-esp-elf"
+
+        march=
+        mabi=
+        # source: esp-idf/tools/cmake/toolchain-clang-*.cmake
+        case "$CONFIG_IDF_TARGET" in
+          esp32c2|esp32c3|esp32h2)
+            march=rv32imc_zicsr_zifencei
+            mabi=ilp32
+            ;;
+          esp32c5|esp32c6|esp32c61)
+            march=rv32imac_zicsr_zifencei
+            mabi=ilp32
+            ;;
+          esp32h4)
+            march=rv32imafc_zicsr_zifencei
+            mabi=ilp32
+            ;;
+          esp32p4)
+            march=rv32imafc_zicsr_zifencei_xesppie
+            mabi=ilp32f
+            ;;
+          *)
+            echo "$appName: Warning: Unknown ESP target: $CONFIG_IDF_TARGET" >&2
+            ;;
+        esac
+
+        systemHeaderClangArgs+=(-target "$targetArch")
+        [[ -n "$march" ]] && systemHeaderClangArgs+=("-march=$march")
+        [[ -n "$mabi" ]] && systemHeaderClangArgs+=("-mabi=$mabi")
+        ;;
+      *)
+        exitError "sdkconfig specifies unsupported architecture: $CONFIG_IDF_TARGET_ARCH" >&2
+        ;;
+    esac
+
+    if [[ -n "$forceReason" ]]; then
+      if [[ -e "$xcespBuildDir" ]]; then
+        showInfo "Replacing existing xcesp build directory ($forceReason): $xcespBuildDir"
+      fi
+      rm -rf "$xcespBuildDir"
+    fi
+
+    mkdir -p "$xcespBuildDir"
+    echo "*" > "$xcespBuildDir/.gitignore"
+
+    cp "$project/sdkconfig" "$xcespBuildDir/sdkconfig"
+
+    # Determine system header search paths, which we need to add for Xcodes clang indexer to work
+    systemHeaderSearchPaths=(
+          $($XCESP_CLANG/bin/clang -v -E -x c++ /dev/null ${systemHeaderClangArgs[@]} 2>&1 | grep '^ /')
+    )
+    if [[ ${#systemHeaderSearchPaths} -eq 0 ]]; then
+      exitError <<EOT
+Could not determine system header search paths via:
+$XCESP_CLANG/bin/clang -v -E -x c++ /dev/null ${systemHeaderClangArgs[@]}
+EOT
+    fi
+    systemHeaderSearchPaths="${systemHeaderSearchPaths[@]}"
+
+    # Use cmake to build the xcode project structure
+    showInfo "Running cmake"
+    set -e
+
+    cmake -G Xcode -B "$xcespBuildDir" \
+      -DPYTHON_DEPS_CHECKED=1 -DPYTHON="$IDF_PYTHON_ENV_PATH/bin/python" \
+      -DESP_PLATFORM=1 -DCCACHE_ENABLE=False \
+      -DIDF_TOOLCHAIN=clang -DIDF_PATH="$IDF_PATH" -DIDF_TARGET=$cpu -DCMAKE_SYSTEM_NAME=xcesp \
+      -DCMAKE_CONFIGURATION_TYPES=Debug -DCMAKE_XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH=YES \
+      -DCMAKE_XCODE_GENERATE_SCHEME=1 \
+      -DCMAKE_XCODE_ATTRIBUTE_XCESP_ARCH="'"$targetArch"'" \
+      -DCMAKE_XCODE_ATTRIBUTE_XCESP_CPU="'"$cpu"'" \
+      -DCMAKE_XCODE_ATTRIBUTE_OTHER_CFLAGS='-DXCESP_ARCH=$(XCESP_ARCH) -DXCESP_CPU=$(XCESP_CPU)' \
+      -DCMAKE_XCODE_ATTRIBUTE_WARNING_CFLAGS='-Wno-error=unknown-attributes' \
+      -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+      -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
+      -DCMAKE_XCODE_ATTRIBUTE_SKIP_INSTALL=YES \
+      -DCMAKE_XCODE_ATTRIBUTE_SDKROOT=driverkit \
+      -DCMAKE_XCODE_ATTRIBUTE_SYSTEM_HEADER_SEARCH_PATHS=${systemHeaderSearchPaths} \
+      "$project"
+    set +e
+
+    xcodeproj=$(find $xcespBuildDir/*.xcodeproj -maxdepth 0)
+    showInfo "Fixing project.pbxproj"
+
+    # Remove -mcpu option from xcode project (not supported by default clang, which is still sometimes used by Xcode internally)
+    sed -i "" -E 's/ -mcpu=[^ ]+ / /g' "$xcespBuildDir"/*.xcodeproj/project.pbxproj
+
+    RISCV_GCC_BINDIR=$(dirname $(which riscv32-esp-elf-gcc))
+    XTENSA_GCC_BINDIR=$(dirname $(which xtensa-esp32-elf-gcc))
+
+    # Ensure toolchain is still set to "clang" and environment variables (PATH etc.) are set
+    sed -i "" -E 's|^(if test .*)$|export IDF_TOOLCHAIN=clang;export TOOLCHAINS=com.kohlschutter.xcesp.toolchain;export PATH='$(printf "%q" "$XCESP_CLANG/bin")':'$(printf "%q" "$RISCV_GCC_BINDIR")':'$(printf "%q" "$XTENSA_GCC_BINDIR")':$PATH; export IDF_PATH='$(printf "%q" "$IDF_PATH")'; \1|' "$xcespBuildDir"/*.xcodeproj/project.pbxproj
+
+    # Force single "Debug" build for cmake calls made from within Xcode targets
+    sed -i "" -E 's|^(.*cmake.*)(\-DSDKCONFIG=.*)$|\1 -DIDF_TOOLCHAIN=clang -DCMAKE_CONFIGURATION_TYPES=Debug \2|' "$xcespBuildDir"/*.xcodeproj/project.pbxproj
+
+    # Suppress unnecessary warnings from bootloader->bootloader-build
+    sed -i "" -E 's|(cmake --build . --config Debug)$|\1 >/dev/null|' "$xcespBuildDir"/*.xcodeproj/project.pbxproj
+
+    workspaceSettings=$xcodeproj/project.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+    if [[ -e "$workspaceSettings" ]]; then
+        showInfo "Fixing WorkspaceSettings"
+
+        # hat tip: https://hisaac.net/blog/set-an-xcode-projects-deriveddata-location-via-script/
+        plutil -replace BuildLocationStyle -string UseAppPreferences "$workspaceSettings"
+        plutil -replace DerivedDataCustomLocation -string DerivedData "$workspaceSettings"
+        plutil -replace DerivedDataLocationStyle -string WorkspaceRelativePath "$workspaceSettings"
+
+        userdatad=$xcodeproj/project.xcworkspace/xcuserdata/${USER}.xcuserdatad
+        mkdir -p $userdatad
+        cp "$workspaceSettings" $userdatad/WorkspaceSettings.xcsettings
+    fi
+
+    if [[ $open -eq 0 ]]; then
+        notesAtEnd+=(
+            "Last step: In Xcode, please set the Scheme to __idf_main (or ALL_BUILD) and the Run Destination to \"My Mac (DriverKit)\""
+        )
+    fi
+fi
+
+if [[ $build -gt 0 ]]; then
+    showInfo "Building with xcodebuild; scheme: $scheme"
+    set -e
+    mkdir -p build-xcesp/$derivedDataXcb/
+
+    # Ensure clean build
+    rm -rf $(find build-xcesp/$derivedDataXcb -name "Intermediates.noindex") || true
+
+    xcodebuild \
+        -project build-xcesp/*.xcodeproj \
+        -scheme "$scheme" \
+        -derivedDataPath $(realpath build-xcesp/$derivedDataXcb/) \
+        -parallelizeTargets \
+        -destination 'platform=macOS,arch=arm64' \
+        build
+    set +e
+    showInfo "Completed building with xcodebuild"
+fi
+
+if [[ $flash -gt 0 ]]; then
+    set -e
+
+    showInfo "Building with idf.py (for flash)"
+    which idf.py >/dev/null || source "$IDF_PATH/export.sh"
+    export IDF_TOOLCHAIN=clang
+    idf.py build
+    showInfo "Completed building with idf.py (for flash)"
+
+    if [[ $build -gt 0 ]]; then
+        showInfo "Copying binaries from build-xcesp to build (for flash)"
+        for f in $( cd build-xcesp; find . -name "*.bin" -type f | grep -v /CMake ); do
+          cp -av "build-xcesp/$f" "build/$f"
+        done
+        showInfo "Completed copying binaries from build-xcesp to build (for flash)"
+    fi
+
+    showInfo "Running idf.py flash"
+    idf.py flash
+    showInfo "Completed running idf.py flash"
+
+    set +e
+fi
+
+if [[ $open -gt 0 ]]; then
+    showInfo "Opening $xcodeproj"
+    open "$xcodeproj"
+    if [[ -e "main/CMakeLists.txt" ]]; then
+        notesAtEnd+=(
+           "main source code can be found under __idf_main"
+        )
+    fi
+
+    (
+    scheme="__idf_main"
+    destination="My Mac (DriverKit)"
+    showInfo "Trying to set scheme \"$scheme\" and run destination \"$destination\" via AppleScript"
+    sleep 1
+
+osascript <<EOT
+tell application "Xcode"
+    set triesRemaining to 40
+
+    repeat
+        try
+            set wd to (first workspace document whose path is "$xcodeproj")
+            if exists wd then
+                tell wd
+                    try
+                        set active scheme to scheme "$scheme"
+                    on error
+                        try
+                            set active scheme to scheme "ALL_BUILD"
+                        end try
+                    end try
+                    set active run destination to run destination "$destination"
+                    exit repeat
+                end tell
+            end if
+        end try
+
+        set triesRemaining to triesRemaining - 1
+        if triesRemaining is 0 then
+            exit repeat
+        end if
+
+        delay 0.5
+    end repeat
+end tell
+EOT
+) &
+else
+    showInfo "Done! Xcode project is here: $xcodeproj"
+fi
+
+for n in ${notesAtEnd[@]}; do
+    showNotice "$n"
+done
+
+if [[ $monitor -gt 0 ]]; then
+    which idf.py >/dev/null || source "$IDF_PATH/export.sh"
+    export IDF_TOOLCHAIN=clang
+
+    showInfo "Running idf.py monitor; exit with CTRL-]"
+    idf.py monitor
+fi
+
+if [[ -n "$idfCommand" ]]; then
+    which idf.py >/dev/null || source "$IDF_PATH/export.sh"
+    export IDF_TOOLCHAIN=clang
+
+    cmd=(${(@s: :)idfCommand})
+    showInfo <<EOT
+Running idf.py ${cmd[@]}
+EOT
+    idf.py ${cmd[@]}
+fi
