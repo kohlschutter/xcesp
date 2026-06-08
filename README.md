@@ -28,6 +28,8 @@ sets up symbolic links for the toolchain and ESP-IDF SDK.
 
     ./xcesp-install
 
+You will need [ESP-IDF 6.0](https://github.com/espressif/esp-idf) or later installed on your system, with IDF_PATH set up correctly during install.
+
 To open or create an Xcode project for a given ESP-IDF project, just `cd` to that project directory
 and run `xcesp. For example,
 
